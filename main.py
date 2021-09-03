@@ -34,8 +34,10 @@ from ibapi.order_state import * # @UnusedWildImport
 from ibapi.execution import Execution
 from ibapi.execution import ExecutionFilter
 from ibapi.commission_report import CommissionReport
+from ibapi.ticktype import *
 from ibapi.tag_value import TagValue
 from twsapi import IBapi
+from secrets import AppConfig
 
 import enum
 import pandas as pd
@@ -45,7 +47,7 @@ import datetime
 import itertools
 import pprint
 import copy
-from secrets import AppConfig
+
 
 
 #Get current timestamp
@@ -54,12 +56,12 @@ def getTimeNow():
 	return timeNow
 
 #define connection variables
-# TWS_IP = '127.0.0.1'
-# TWS_PORT = 7497
-# API_ID = 1
-# ACCOUNT_NUMBER = 'DU2645159'
+TWS_IP = '127.0.0.1'
+TWS_PORT = 7497
+API_ID = 1
+ACCOUNT_NUMBER = 'DU2645159'
 
-appConfig = AppConfig()
+# appConfig = AppConfig()
 
 #define other program variables
 checkTradingHours = True
@@ -76,11 +78,8 @@ precision = 0.015
 backtestFlag = False
 requestDelay = 1
 loopDelay = 30
-# orderFilled = False
-# orderMod = False
 lastParentId = 0
-# lastOrderPrice = 0
-# modAttempt = 1
+
 ...
 print('\n\n####################################\n'
 ,getTimeNow(),
@@ -171,7 +170,7 @@ class OptionGreeks():
 		try:
 			#get contract expiration date
 			for i in range(len(self.exps)):
-				if self.exps[i][2] >= 1 and self.exps[i][2] <= 5:
+				if self.exps[i][2] >= optMinDTE and self.exps[i][2] <= optMaxDTE:
 					daysTillExp = (datetime.datetime.strptime(self.exps[i][0], "%Y%m%d") - today).days
 					if ((self.optC.lastTradeDateOrContractMonth == None) or (self.exps[i][0] < self.optC.lastTradeDateOrContractMonth)) and (daysTillExp > 0):
 						self.optC.lastTradeDateOrContractMonth = self.exps[i][0]
@@ -246,7 +245,7 @@ def run_loop():
 
 #create new app API object and connect to API
 app = IBapi()
-app.connect(appConfig.TWS_IP, appConfig.TWS_PORT, appConfig.API_ID)
+app.connect(TWS_IP, TWS_PORT, API_ID)
 
 #Start the socket in a thread
 try:
@@ -268,14 +267,16 @@ def tradingHours():
 	end = time.strptime("13:15:00", "%H:%M:%S")
 
 	#get TWS time
-	app.reqCurrentTime()
-	time.sleep(1)
-	twsTime = app.twsTime
+	try:
+		app.reqCurrentTime()
+		time.sleep(requestDelay)
+		twsTime = app.twsTime
+	except:
+		print('TWS current time request failed')
 
 	try:
-		timeCheck = datetime.datetime.fromtimestamp(twsTime, tz=None).strftime("%a %d-%b-%Y %H:%M:%S")
-		print('>>> Current TWS time: ', timeCheck)
-		timeCheck = time.strptime(timeCheck, "%a %d-%b-%Y %H:%M:%S")
+		timeCheck = datetime.datetime.fromtimestamp(twsTime, tz=None).strftime("%H %M %S")
+		timeCheck = time.strptime(timeCheck, "%H %M %S")
 	except:
 		print('Time Check Failed')
 
@@ -378,14 +379,20 @@ def checkVixPrice(id):
 	flag = False
 
 	#check trading hours to use last or close price
-	if tradingHours():
-		tickPrice = TickTypeEnum.LAST + 1
-	else:
-		tickPrice = TickTypeEnum.CLOSE + 1
+	try:
+		if tradingHours():
+			tickPrice = TickTypeEnum.LAST + 1
+		else:
+			tickPrice = TickTypeEnum.CLOSE + 1
+	except:
+		print('Something failed')
 
-	for i in range(len(app.marketData)):
-		if (app.marketData[i][0] == id):
-			price = app.marketData[i][tickPrice]
+	try:
+		for i in range(len(app.marketData)):
+			if (app.marketData[i][0] == id):
+				price = app.marketData[i][tickPrice]
+	except:
+		print('Unable to get VIX market data')
 
 	#VIX trading threshold is $30
 	#if current price is at or above threshold then set VIX flag to True
@@ -634,7 +641,7 @@ main trading strategy logic
 def optionsStrategy():
 	#subscribe to account & portfolio updates
 	try:
-		app.reqAccountUpdates(True, appConfig.ACCOUNT_NUMBER)
+		app.reqAccountUpdates(True, ACCOUNT_NUMBER)
 		time.sleep(requestDelay)
 		# app.reqGlobalCancel()
 
