@@ -7,3 +7,4 @@ requirements.txt
 trading_bot.log
 Archive
 __pycache__
+secrets.py

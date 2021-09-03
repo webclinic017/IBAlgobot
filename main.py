@@ -45,6 +45,7 @@ import datetime
 import itertools
 import pprint
 import copy
+from secrets import AppConfig
 
 
 #Get current timestamp
@@ -53,10 +54,12 @@ def getTimeNow():
 	return timeNow
 
 #define connection variables
-TWS_IP = '127.0.0.1'
-TWS_PORT = 7497
-API_ID = 1
-ACCOUNT_NUMBER = 'DU2645159'
+# TWS_IP = '127.0.0.1'
+# TWS_PORT = 7497
+# API_ID = 1
+# ACCOUNT_NUMBER = 'DU2645159'
+
+appConfig = AppConfig()
 
 #define other program variables
 checkTradingHours = True
@@ -243,7 +246,7 @@ def run_loop():
 
 #create new app API object and connect to API
 app = IBapi()
-app.connect(TWS_IP, TWS_PORT, API_ID)
+app.connect(appConfig.TWS_IP, appConfig.TWS_PORT, appConfig.API_ID)
 
 #Start the socket in a thread
 try:
@@ -631,7 +634,7 @@ main trading strategy logic
 def optionsStrategy():
 	#subscribe to account & portfolio updates
 	try:
-		app.reqAccountUpdates(True, ACCOUNT_NUMBER)
+		app.reqAccountUpdates(True, appConfig.ACCOUNT_NUMBER)
 		time.sleep(requestDelay)
 		# app.reqGlobalCancel()
 
