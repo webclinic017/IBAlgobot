@@ -9,3 +9,6 @@ Archive
 __pycache__
 secrets.py
 .DS_Store
+.log
+.prof
+.csv  

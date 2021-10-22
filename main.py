@@ -27,7 +27,8 @@ sys.path.append('/home/')
 
 # types
 from ibapi.common import * # @UnusedWildImport
-from ibapi.order_condition import * # @UnusedWildImport
+from ibapi import order_condition
+from ibapi.order_condition import *
 from ibapi.contract import *
 from ibapi.order import *
 from ibapi.order_state import * # @UnusedWildImport
@@ -37,7 +38,6 @@ from ibapi.commission_report import CommissionReport
 from ibapi.ticktype import *
 from ibapi.tag_value import TagValue
 from twsapi import IBapi
-from secrets import AppConfig
 
 import enum
 import pandas as pd
@@ -47,6 +47,8 @@ import datetime
 import itertools
 import pprint
 import copy
+import logging
+import math
 
 
 
@@ -54,12 +56,58 @@ import copy
 def getTimeNow():
 	timeNow = datetime.datetime.now().strftime("%d%b%y_%H%M%S_%f")
 	return timeNow
+#log config
+class CustomFormatter(logging.Formatter):
+
+    grey = "\x1b[38;21m"
+    green = "\x1b[32;21m"
+    yellow = "\x1b[33;21m"
+    red = "\x1b[31;21m"
+    bold_red = "\x1b[41;41m"
+    # bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    format = "%(asctime)s.%(name)s.%(lineno)d.%(levelname)s:  %(message)s"
+
+    FORMATS = {
+        logging.DEBUG: green + format + reset,
+        logging.INFO: grey + format + reset,
+        logging.WARNING: yellow + format + reset,
+        logging.ERROR: red + format + reset,
+        logging.CRITICAL: bold_red + format + reset
+    }
+
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
+#create logger
+moduleName = 'IBTradingBot'
+log = logging.getLogger(moduleName)
+log.setLevel(logging.DEBUG)
+#create file handler
+fh = logging.FileHandler('app.log')
+fh.setLevel(logging.DEBUG)
+#create console handler
+ch = logging.StreamHandler()
+ch.setLevel(logging.INFO)
+#create formatter & add it to handlers
+formatter = logging.Formatter('%(asctime)s.%(name)s.%(levelname)s: %(message)s','%Y%m%d_%H:%M:%S')
+fh.setFormatter(formatter)
+ch.setFormatter(CustomFormatter())
+# ch.setFormatter(formatter)
+#add handlers to logger
+log.addHandler(fh)
+log.addHandler(ch)
+
+# logging.basicConfig(filename=f'trading_bot.log', level=logging.INFO)
+# log.info("now is %s", datetime.datetime.now())
 
 #define connection variables
 TWS_IP = '127.0.0.1'
 TWS_PORT = 7497
 API_ID = 1
-ACCOUNT_NUMBER = 'DU2645159'
+ACCOUNT_NUMBER = '' #update account number 
 
 # appConfig = AppConfig()
 
@@ -67,23 +115,25 @@ ACCOUNT_NUMBER = 'DU2645159'
 checkTradingHours = True
 reqUID = 1000
 vixFlag = 0
-optMaxDTE = 5
+optMaxDTE = 3
 optMinDTE = 1
 activeReqs = []
 activeOrders = []
 targetFactor = 1
 nStrikes = 45
-targetDelta = -0.15
-precision = 0.015
+# targetDelta = -0.08
+profitTarget = .55
+stopTarget = .55
+maxTradeMargin = 0.75
+spreadLimit = 20000 #upper limit of spread margin
+precision = 0.05
 backtestFlag = False
 requestDelay = 1
-loopDelay = 30
+loopDelay = 10
 lastParentId = 0
 
 ...
-print('\n\n####################################\n'
-,getTimeNow(),
-'\n####################################\n')
+log.info('##### %s #####', getTimeNow())
 
 class ReqUid():
 	iter = itertools.count(1000,1)
@@ -102,32 +152,36 @@ class OptionGreeks():
 		self.nStrikes = 45
 		self.optGreeks = []
 		self.DTE = 0
-		self.conEXpDate = None
+		self.conExpDate = None
 		self.tradingClass = None
 		self.priceTarget = priceTarget
+		# self.log = logging.getLogger('IBTradingBot.twsapi.OptionGreeks')
 		# self.tradeMargin = tradeSize()[0]
 
 	def getConID(self):
 		#request contract details to get contract ID
-		print(f'Request {self.c.symbol} contract details')
+		# print(f'Request {self.c.symbol} contract details')
+		log.debug(f'Request %s contract details', self.c.symbol)
 		try:
 			app.deets = []
 			app.reqContractDetails(getReqID(), self.c)
 			time.sleep(1)
 			contractDetailsDF = pd.DataFrame(app.deets, columns=['ReqID','ConID','Symbol','LastTradeDate','Strike','Right','UnderlyingContractID'])
-			print(f'Contract Detail request for {self.c.symbol} \n', contractDetailsDF)
+			log.debug('Contract Detail request for %s', self.c.symbol)
+			log.debug('contractDetailsDF: \n %s', contractDetailsDF)
+			# print(f'Contract Detail request for {self.c.symbol} \n', contractDetailsDF)
 			self.underCID = app.deets[0][6]
 			conID = app.deets[0][1]
 			if (self.c.secType == 'STK') or (self.c.secType == 'IND'):
 				self.underCID = conID
 		except:
-			print('Contract Details Request Failed')
+			log.error('Contract Details Request Failed')
 
 		self.getOptionsChain()
 
 	def getOptionsChain(self):
 		#Reqeust options chain
-		print(f'Request {self.optC.symbol} options chain')
+		log.info('Request %s options chain',self.optC.symbol)
 		self.optGreeks = []
 		try:
 			app.reqSecDefOptParams(getReqID(), self.optC.symbol, "", self.optC.secType, self.underCID)
@@ -164,7 +218,7 @@ class OptionGreeks():
 			self.exps.sort()
 			self.strikes.sort(reverse=True)
 		except:
-			print('Security Definiton Options Parameters Request Failed.')
+			log.error('Security Definiton Options Parameters Request Failed.')
 
 		#find an expiration date to trade > 1 DTE, < 5 DTE
 		try:
@@ -176,14 +230,14 @@ class OptionGreeks():
 						self.optC.lastTradeDateOrContractMonth = self.exps[i][0]
 						self.optC.tradingClass = self.exps[i][1]
 						self.DTE = (datetime.datetime.strptime(self.optC.lastTradeDateOrContractMonth, "%Y%m%d") - today).days
-						self.conEXpDate = self.optC.lastTradeDateOrContractMonth
+						self.conExpDate = self.optC.lastTradeDateOrContractMonth
 						self.tradingClass = self.optC.tradingClass
 			#
 			# filter strike list for the first nStrikes that are <= price target AND == expiration trading class
 			strikeFilter = [list(filter(lambda n: (n[0]<= self.priceTarget) and (n[1] == self.optC.tradingClass), self.strikes))[i] for i in list(range(self.nStrikes))]
 			# print(strikeFilter)
 		except:
-			print('Strike Filter exception')
+			log.error('Strike Filter exception')
 
 		try:
 			#iterate through strikes to request contract details & market data to get options greeks and contract IDs for order
@@ -199,17 +253,16 @@ class OptionGreeks():
 					app.reqContractDetails(spxID, self.optC)
 					self.optGreeks.append([spxID, self.optC.strike])
 				except:
-					print(f'{self.optC.symbol} Market Data Request failed')
+					log.error('%s Market Data Request failed',self.optC.symbol)
 			time.sleep(4)
 			# contractDetailsDF = pd.DataFrame(app.deets, columns=['ReqID','ConID','Symbol','LastTradeDate','Strike','Right','UnderlyingContractID'])
 			# print(f'Contract Detail request for {self.optC.symbol} \n', contractDetailsDF)
 		except:
-			print('Strike contract ID request failed')
+			log.error('Strike contract ID request failed')
 
 		self.getOptGreeks()
 
 	def getOptGreeks(self):
-		print('getOptGreeks')
 		#get option greeks for each contract
 		try:
 			#get contract IDs from contract details
@@ -226,7 +279,7 @@ class OptionGreeks():
 
 			# print('\nOption Greeks: ',self.optGreeks)
 		except:
-			print('Unable to get optiions greeks!')
+			log.error('Unable to get optiions greeks!')
 		# try:
 		for i in range(len(self.optGreeks)):
 			stopMarketData(self.optGreeks[i][0])
@@ -243,9 +296,27 @@ class OptionGreeks():
 def run_loop():
 	app.run()
 
+def apiConnect():
+	app.connect(TWS_IP, TWS_PORT, API_ID)
+	log.info('>>> API Connecting <<<')
+
 #create new app API object and connect to API
 app = IBapi()
-app.connect(TWS_IP, TWS_PORT, API_ID)
+apiConnect()
+
+#create funciton to check if connected to TWS
+def connectionMonitor():
+	log = logging.getLogger(moduleName+'.connectionMonitor')
+	wait = 2
+	while True:
+		if app.connected == False:
+			log.critical('Connection to TWS Broken!')
+			apiConnect()
+			log.warning('Reconnecting...')
+			time.sleep(wait)
+			wait = wait * 1.5
+
+
 
 #Start the socket in a thread
 try:
@@ -253,8 +324,13 @@ try:
 	api_thread.start()
 	time.sleep(1) #Sleep interval to allow time for connection to server
 except:
-	logging.error('Unable to start API thread!')
+	log.error('Unable to start API thread!')
 
+try:
+	connMon_thread = threading.Thread(target=connectionMonitor, daemon=True)
+	connMon_thread.start()
+except:
+	log.error('Unable to start connection monitor thread!')
 #Get unique request ID
 def getReqID():
 	reqUid = ReqUid().id
@@ -262,23 +338,29 @@ def getReqID():
 
 #Check if current time is within regular trading hours
 def tradingHours():
+	log = logging.getLogger(moduleName+'.tradingHours')
+	log.debug('checking trading hours')
 	#set trading hours in local time
 	start = time.strptime("06:30:00", "%H:%M:%S")
 	end = time.strptime("13:15:00", "%H:%M:%S")
+	log.debug('start: %s', time.strftime("%H:%M:%S",start))
+	log.debug('end: %s', time.strftime("%H:%M:%S",end))
 
 	#get TWS time
 	try:
 		app.reqCurrentTime()
 		time.sleep(requestDelay)
 		twsTime = app.twsTime
+		log.debug('twsTime: %s', twsTime)
 	except:
-		print('TWS current time request failed')
+		log.error('TWS current time request failed')
 
 	try:
 		timeCheck = datetime.datetime.fromtimestamp(twsTime, tz=None).strftime("%H %M %S")
 		timeCheck = time.strptime(timeCheck, "%H %M %S")
+		log.debug('timeCheck: %s', time.strftime("%H:%M:%S",timeCheck))
 	except:
-		print('Time Check Failed')
+		log.error('Time Check Failed')
 
 	#return true if current time is within range [start,end]
 	if start <= end:
@@ -287,24 +369,72 @@ def tradingHours():
 		return start <= timeCheck or currentTime <= end
 
 #calculate available margin for trading
-def tradeSize():
-	lowMarginFlag = False
-	availableMargin = float(app.accountData.get("ExcessLiquidity"))
-	tradeMargin = round((availableMargin/4)/500)*500
-	if availableMargin < 1000:
-		lowMarginFlag = True
+# def tradeSize():
+# 	lowMarginFlag = False
+# 	availableMargin = float(app.accountData.get("ExcessLiquidity"))
+# 	tradeMargin = round((availableMargin/4)/500)*500
+# 	if availableMargin < 1000:
+# 		lowMarginFlag = True
+#
+# 	return (tradeMargin, lowMarginFlag)
+def TimeCondition(time:str, isMore:bool, isConjunction:bool):
 
-	return (tradeMargin, lowMarginFlag)
+	#! [time_condition]
+	timeCondition = order_condition.Create(OrderCondition.Time)
+	#Before or after...
+	timeCondition.isMore = isMore
+	#this time..
+	timeCondition.time = time
+	#AND | OR next condition (will be ignored if no more conditions are added)
+	timeCondition.isConjunctionConnection = isConjunction
+	#! [time_condition]
+	return timeCondition
+
+def tradeSize():
+	marginAvailable = float(app.accountData.get("ExcessLiquidity"))
+	if marginAvailable > spreadLimit:
+		qty = math.ceil(marginAvailable/spreadLimit)
+		margin = round(marginAvailable/(qty*500),0)*500
+	else:
+		qty = 1
+		margin = marginAvailable
+	return(margin,qty)
+
+def setShortDelta(VIX):
+	#set short delta based on VIX
+	if VIX >= 50:
+		sd = 0
+	elif (VIX < 50) and (VIX >= 45):
+		sd = -0.06
+	elif (VIX < 45) and (VIX >= 35):
+		sd = -0.08
+	elif (VIX < 35) and (VIX >= 30):
+		sd = -0.10
+	elif (VIX < 30) and (VIX >= 25):
+		sd = -0.15
+	elif (VIX < 25) and (VIX >= 20):
+		sd = -0.20
+	elif (VIX < 20) and (VIX >= 15):
+		sd = -0.30
+	elif (VIX < 15) and (VIX >= 10):
+		sd = -0.40
+	elif (VIX < 10) and (VIX >= 5):
+		sd = -0.50
+
+	return(sd)
+
+
 
 #start streaming market data request
 def getMarketData(reqID, contract):
-	# print(f'{type(self).__name__}.start: {contract.symbol}')
+	log = logging.getLogger(moduleName+'.getMarketData')
 	app.reqMktData(reqID, contract, "", False, False, [])
 	activeReqs.append(reqID)
-	print(f'New Market Data Request: {reqID}, {contract.symbol}. # Active Requests: {len(activeReqs)}')
+	log.info('New Market Data Request: %s, %s  # Active Requests: %s ', reqID, contract.symbol, len(activeReqs))
 
 #stop streaming market data request
 def stopMarketData(reqID):
+	log = logging.getLogger(moduleName+'.stopMarketData')
 	app.cancelMktData(reqID)
 	activeReqs.remove(reqID)
 
@@ -312,28 +442,29 @@ def stopMarketData(reqID):
 		if (app.marketData[i][0] == reqID):
 			app.marketData.pop(i)
 			break
-	print(f'Cancel Market Data Request: {reqID}. # Active Requests: {len(activeReqs)}')
+	log.info('Cancel Market Data Request: %s # Active Requests: %s', reqID, len(activeReqs))
 #cancel all streaming market data
 
 def stopAllMarketData():
+	log = logging.getLogger(moduleName+'.stopAllMarketData')
 	try:
 		while len(activeReqs) > 0:
 			reqID = activeReqs[0]
 			app.cancelMktData(reqID)
 			activeReqs.remove(reqID)
-			print(f'Cancel Market Data Request: {reqID}. # Active Requests: {len(activeReqs)}')
+			log.info('Cancel Market Data Request: %s # Active Requests: %s', reqID, len(activeReqs))
 			# time.sleep(0.2)
 	except:
-		print('Unable to cancel all Market Data Requests')
+		log.error('Unable to cancel all Market Data Requests')
 
 #check if portfolio has open SPX positions or open orders
 def getOpenPositions():
+	log = logging.getLogger(moduleName+'.getOpenPositions')
 	#check portfolio for open SPX position
 	time.sleep(1) #wait to ensure we've received account details
 	portfolioDF = pd.DataFrame(app.portfolio, columns=['Symbol', 'Security', 'Strike', 'Exp Date', 'Right',
 	'position', 'marketPrice', 'marketValue', 'averageCost', 'unrealizedPNL', 'realizedPNL', 'accountName'])
-	print('\nPortfolio: \n',portfolioDF)
-	# portfolioDf.to_csv('portolio.csv')
+	log.info('Portfolio: \n\n %s \n',portfolioDF)
 	return(portfolioDF)
 
 def checkOpenPositions(DF, symbol):
@@ -344,13 +475,14 @@ def checkOpenPositions(DF, symbol):
 	return(flag)
 
 def getOpenOrders():
+	log = logging.getLogger(moduleName+'.getOpenOrders')
 	# print('Request all open orders')
 	app.openOrders = []
 	app.reqAllOpenOrders()
 	time.sleep(1)
-	openOrdersDF = pd.DataFrame(app.openOrders, columns=["PermId", "ClientId", "OrderId",
+	openOrdersDF = pd.DataFrame(app.openOrders, columns=["PermId", "ClientId", "OrderRef", "ParentId", "OrderId",
 	"Account", "Symbol", "SecType", "Exchange", "Action", "OrderType", "TotalQty", "CashQty", "LmtPrice", "AuxPrice", "Status"])
-	print('\nOpen Orders: \n', openOrdersDF)
+	log.info('Open Orders: \n\n%s\n', openOrdersDF)
 	return(openOrdersDF)
 
 def checkOpenOrders(DF, symbol):
@@ -376,37 +508,48 @@ def getVixPrice():
 	return(id)
 
 def checkVixPrice(id):
+	log = logging.getLogger(moduleName+'.checkVixPrice')
 	flag = False
 
 	#check trading hours to use last or close price
 	try:
-		if tradingHours():
+		tradingHoursFlag = tradingHours()
+		log.debug('tradingHours: %s', tradingHoursFlag)
+		if tradingHoursFlag:
 			tickPrice = TickTypeEnum.LAST + 1
 		else:
 			tickPrice = TickTypeEnum.CLOSE + 1
 	except:
-		print('Something failed')
+		log.error('Something failed')
 
 	try:
 		for i in range(len(app.marketData)):
 			if (app.marketData[i][0] == id):
 				price = app.marketData[i][tickPrice]
 	except:
-		print('Unable to get VIX market data')
-
+		log.error('Unable to get VIX market data')
+	log.debug('VIX Price: %s',price)
 	#VIX trading threshold is $30
 	#if current price is at or above threshold then set VIX flag to True
-	if price >= 30:
+
+	shortDelta = setShortDelta(price)
+
+	if price >= 50:
 		flag = True
 
-	return(flag)
+	return(flag, shortDelta)
 
 def getOptionsGreeks(reqID):
+	log = logging.getLogger(moduleName+'.getOptionsGreeks')
 	output = []
+	dataFlag = False
+	log.debug('ReqID: %s', reqID)
 	for i in range(len(app.marketData)):
 		id = app.marketData[i][0]
 
 		if id == reqID:
+			log.debug('Market Data: \n%s', app.marketData[i])
+			dataFlag = True
 			bidSize = app.marketData[i][1]
 			bidPrice = app.marketData[i][2]
 			askPrice = app.marketData[i][3]
@@ -430,9 +573,15 @@ def getOptionsGreeks(reqID):
 
 			data = [id, bidPrice, bidSize, askPrice, askSize, lastPrice, lastSize] + greeks
 			output.append(data)
+	log.debug('Options Greeks Data:\n%s', output)
+	if dataFlag == False:
+		log.critical('No Options Greeks Data... check market data subscription!')
+		time.sleep(3)
+		return getOptionsGreeks(reqID)
 	return(output)
 
-def getComboStrikes(optGreeks,tradeMargin):
+def getComboStrikes(optGreeks,tradeMargin,targetDelta):
+	log = logging.getLogger(moduleName+'.getComboStrikes')
 	#function to find the short & long strike prices for put spread combo based on options delta and available trade margin
 	#find short strike
 	shortStrike = 0
@@ -454,9 +603,9 @@ def getComboStrikes(optGreeks,tradeMargin):
 					shortStrike = optGreeks[i][1]
 					shortConID = optGreeks[i][2]
 					shortDelta = optGreeks[i][11]
-					print(shortStrike, shortConID, shortDelta)
+					# log.debug('Short Strike: %s, ShortConID: %s, ShortDelta: %s',shortStrike, shortConID, shortDelta)
 	except:
-		print('Unable to get short strike!')
+		log.error('Unable to get short strike!')
 
 	#find long strike
 	try:
@@ -470,25 +619,31 @@ def getComboStrikes(optGreeks,tradeMargin):
 				longConID = optGreeks[i][2]
 				longDelta = optGreeks[i][11]
 	except:
-		print('Unable to get long strike!')
+		log.error('Unable to get long strike!')
 
-	print('\nShort Strike: ', shortStrike)
-	print('Short Delta: ', shortDelta)
-	print('Short Contract ID:', shortConID)
-	print('Long Strike: ', longStrike)
-	print('Long Delta: ', longDelta)
-	print('Long Contract ID:', longConID)
+	log.info('Short Strike: %s', shortStrike)
+	log.info('Short Delta: %s', shortDelta)
+	log.info('Short Contract ID: %s', shortConID)
+	log.info('Long Strike: %s', longStrike)
+	log.info('Long Delta: %s', longDelta)
+	log.info('Long Contract ID: %s', longConID)
 	# stopAllMarketData()
 	# time.sleep(5)
 	return(shortConID,longConID)
 
 
 
-def bracketOrder(action:str, quantity:float, limitPrice:float, takeProfitLimitPrice:float, stopLimitPrice:float, stopLossPrice:float):
+def bracketOrder(action:str, quantity:float, limitPrice:float, takeProfitLimitPrice:float, stopLimitPrice:float, stopLossPrice:float, conExpDate):
+	log = logging.getLogger(moduleName+'.bracketOrder')
 	#get order IDs
 	parentOrderId = app.nextOrderId()
 	takeProfitOrderId = app.nextOrderId()
 	stopLimitOrderId = app.nextOrderId()
+	orderRef = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+
+	log.debug('Exp Date: %s', conExpDate + " 23:59:59")
+	timeCondition = TimeCondition(conExpDate + " 23:59:59", False, False)
+	log.debug('Time Condition: %s', timeCondition.__dict__)
 
 	#parent order
 	parent = Order()
@@ -501,8 +656,9 @@ def bracketOrder(action:str, quantity:float, limitPrice:float, takeProfitLimitPr
 	parent.eTradeOnly = False
 	parent.firmQuoteOnly = False
 	parent.transmit = False
+	parent.orderRef = orderRef
 	# pprint.pprint(parent.__dict__)
-	print('Parent Order OK')
+	log.debug('Parent Order OK')
 
 	#profit taker
 	takeProfit = Order()
@@ -516,8 +672,10 @@ def bracketOrder(action:str, quantity:float, limitPrice:float, takeProfitLimitPr
 	takeProfit.eTradeOnly = False
 	takeProfit.firmQuoteOnly = False
 	takeProfit.transmit = False
+	takeProfit.orderRef = orderRef
+	# takeProfit.conditions.append(TimeCondition(conExpDate + " 23:59:59", False, False))
 	# pprint.pprint(takeProfit.__dict__)
-	print('Take Profit Order OK')
+	log.debug('Take Profit Order OK')
 
 	#stop limit
 	stopLimit = Order()
@@ -532,40 +690,44 @@ def bracketOrder(action:str, quantity:float, limitPrice:float, takeProfitLimitPr
 	stopLimit.eTradeOnly = False
 	stopLimit.firmQuoteOnly = False
 	stopLimit.transmit = True
+	stopLimit.orderRef = orderRef
+	# stopLimit.conditions.append(TimeCondition(conExpDate + " 23:59:59", False, False))
 	# pprint.pprint(stopLimit.__dict__)
-	print('Stop Limit Order OK')
+	log.debug('Stop Limit Order OK')
 
 	bracket = [parent, takeProfit, stopLimit]
 	# pprint.pprint(bracket.__dict__)
 	return(bracket)
 
-def getComboOrder(orderPrice):
+def getComboOrder(orderPrice, tradeMargin, profitTarget, stopTarget, qty, conExpDate):
+	log = logging.getLogger(moduleName+'.getComboOrder')
 
-	takeProfitLimitPrice = round((orderPrice * 0.3)/5, 2)*5
-	stopLimitPrice = round((orderPrice * 3)/5, 2)*5
-	stopLossPrice = round((stopLimitPrice - 0.5)/5, 2)*5
+	# takeProfitLimitPrice = round((orderPrice * 0.3)/5, 2)*5
+	takeProfitLimitPrice = round((orderPrice * (1 - profitTarget))/5, 2)*5
+	# stopLimitPrice = round((orderPrice * 3)/5, 2)*5
+	stopLimitPrice = round((orderPrice * (stopTarget * ((tradeMargin)/1000 )))/5, 2)*5
+	stopLossPrice = round((stopLimitPrice + 0.5)/5, 2)*5
 
-	# oid = app.nextOrderId()
-
-	print('Order Limit Price: ', orderPrice)
-	print('ProfitTaker Limit Price: ', takeProfitLimitPrice)
-	print('Stop Price: ', stopLossPrice)
-	print('Stop Limit Price: ', stopLimitPrice)
+	log.info('Order Limit Price: %s', orderPrice)
+	log.info('ProfitTaker Limit Price: %s', takeProfitLimitPrice)
+	log.info('Stop Price: %s', stopLossPrice)
+	log.info('Stop Limit Price: %s', stopLimitPrice)
 
 	#get combo order with bracket profit-taker + stop-limit
 	try:
-		comboOrder = bracketOrder('BUY', 1, orderPrice, takeProfitLimitPrice, stopLimitPrice, stopLossPrice)
-		print('\nCombo Order: ',comboOrder)
+		comboOrder = bracketOrder('BUY', qty, orderPrice, takeProfitLimitPrice, stopLimitPrice, stopLossPrice, conExpDate)
+		log.info('Combo Order: \n%s\n',comboOrder)
 	except:
-		print('Unable to get combo order!')
+		log.error('Unable to get combo order!')
 
 	return(comboOrder)
 
 def getOrderPrice(comboID, orderMod, lastParentId, lastOrderPrice):
-	print('>>> Getting order price <<<')
+	log = logging.getLogger(moduleName+'.getOrderPrice')
+	log.info('>>> Getting order price <<<')
 	comboGreeks = getOptionsGreeks(comboID)
 	comboGreeksDF = pd.DataFrame(comboGreeks, columns=['ID','Bid','BidSize','Ask','AskSize','Last','LastSize','Underlying','IV','Delta','Gamma','Vega','Theta','PVDiv'])
-	print('\n',comboGreeksDF)
+	log.debug('comboGreeksDF: \n\n%s\n',comboGreeksDF)
 
 	bid = comboGreeks[0][1]
 	ask = comboGreeks[0][3]
@@ -578,7 +740,7 @@ def getOrderPrice(comboID, orderMod, lastParentId, lastOrderPrice):
 		orderPrice = round((((bid+ask)/2)/5), 2)*5
 
 		if orderPrice == lastOrderPrice:
-			print('New price is the same as old price!')
+			log.error('New price is the same as old price!')
 			time.sleep(10)
 			return(getOrderPrice(comboID, orderMod, lastParentId, lastOrderPrice))
 
@@ -588,17 +750,18 @@ def getOrderPrice(comboID, orderMod, lastParentId, lastOrderPrice):
 			# app.reqGlobalCancel()
 			time.sleep(3)
 		except:
-			print('Unable to cancel orders!')
+			log.error('Unable to cancel orders!')
 
 		#submit order mod limit price  @Bid/Ask midpoint; reuse order ID
 		# print('Modifying Order; Attempt: ', modAttempt)
-		print('Modifying Order')
+		log.info('Modifying Order')
 		# modAttempt += 1
 
-	print('Order Price: ', orderPrice)
+	log.info('Order Price: %s', orderPrice)
 	return(orderPrice)
 
-def comboLegLoop(cSPX, priceTarget, tradeMargin):
+def comboLegLoop(cSPX, priceTarget, tradeMargin, targetDelta):
+	log = logging.getLogger(moduleName+'.comboLegLoop')
 	# [optGreeks, conExpDate, DTE, tradingClass] = getOptChains(cSPX, priceTarget)
 	# print('comboLegLoop start', cSPX, priceTarget, tradeMargin)
 	og = OptionGreeks(cSPX, priceTarget)
@@ -610,25 +773,25 @@ def comboLegLoop(cSPX, priceTarget, tradeMargin):
 
 	while (shortConID is None) or (longConID is None):
 		optGreeks = og.optGreeks
-		conExpDate = og.conEXpDate
+		conExpDate = og.conExpDate
 		DTE = og.DTE
 		tradingClass = og.tradingClass
 
 		# streamingFlag = True
 
-		print('\nContract Expiration Date: ',conExpDate)
-		print('\nDTE: ',DTE)
-		print(f'\nAccount Update Time: {app.accountData.get("Time")}')
+		log.info('Contract Expiration Date: %s',conExpDate)
+		log.info('DTE: %s',DTE)
+		log.info('Account Update Time: %s', app.accountData.get("Time"))
 
 		optGreeksDF = pd.DataFrame(optGreeks, columns=['ID','Strike','ContractID','Bid','BidSize','Ask','AskSize','Last','LastSize','Underlying','IV','Delta','Gamma','Vega','Theta','PVDiv'])
-		print('\n',optGreeksDF)
+		log.debug('optGreeksDF: \n%s\n',optGreeksDF)
 
-		[shortConID, longConID] = getComboStrikes(optGreeks,tradeMargin)
-		print('Short Leg Contract ID:',shortConID)
-		print('Long Leg Contract ID:',longConID)
+		[shortConID, longConID] = getComboStrikes(optGreeks,tradeMargin,targetDelta)
+		log.info('Short Leg Contract ID: %s',shortConID)
+		log.info('Long Leg Contract ID: %s',longConID)
 
 		if (shortConID is None) or (longConID is None):
-			print('\n>>>Option Greeks Not Available<<<\n')
+			log.error('>>>Option Greeks Not Available<<<')
 			time.sleep(2)
 			og.getConID()
 
@@ -639,7 +802,13 @@ main trading strategy logic
 
 """
 def optionsStrategy():
+	log = logging.getLogger(moduleName+'.optionsStrategy')
 	#subscribe to account & portfolio updates
+
+	if app.connected == False:
+		time.sleep(15)
+		optionsStrategy()
+
 	try:
 		app.reqAccountUpdates(True, ACCOUNT_NUMBER)
 		time.sleep(requestDelay)
@@ -647,8 +816,8 @@ def optionsStrategy():
 
 		# app.reqIds(-1)
 	except:
-		logging.error('Request Account Update Failed')
-		print('\nRequest Account Update Failed')
+		log.error('Request Account Update Failed')
+		# print('Request Account Update Failed')
 
 	#start VIX market data
 	vixId = getVixPrice()
@@ -678,17 +847,22 @@ def optionsStrategy():
 		vixFlag = True
 		tradeConditionsMet = False
 
+
 		#run loop to check if open positions/orders exist or if VIX is above $30 threshold
 		while (tradeConditionsMet == False):
+			#check if API is connected, if not reconnect
+			# if app.connected == False:
+			# 	apiConnect()
+			# 	time.sleep(1)
 			#show account data
-			tradeMargin = tradeSize()[0]
-			print(f'\nNet Liquidation: ${app.accountData.get("NetLiquidation")}')
-			print(f'Initial Margin: ${app.accountData.get("InitMarginReq")}')
-			print(f'Maintenance Margin: ${app.accountData.get("MaintMarginReq")}')
-			print(f'Total Cash: ${app.accountData.get("TotalCashValue")}')
-			print(f'Unrealized PNL: ${app.accountData.get("UnrealizedPnL")}')
-			print(f'Realized PNL: ${app.accountData.get("RealizedPnL")}')
-			print(f'Trade Margin: $',tradeMargin)
+			[tradeMargin, qty] = tradeSize()
+			log.info('Net Liquidation: $%s',app.accountData.get("NetLiquidation"))
+			log.info('Initial Margin: $%s',app.accountData.get("InitMarginReq"))
+			log.info('Maintenance Margin: $%s',app.accountData.get("MaintMarginReq"))
+			log.info('Total Cash: $%s',app.accountData.get("TotalCashValue"))
+			log.info('Unrealized PNL: $%s',app.accountData.get("UnrealizedPnL"))
+			log.info('Realized PNL: $%s',app.accountData.get("RealizedPnL"))
+			log.info('Trade Margin: $%s',tradeMargin)
 
 			#check if market is open
 			if checkTradingHours == True:
@@ -698,61 +872,70 @@ def optionsStrategy():
 
 
 			if (marketOpenFlag == False):
-				print(f'>>> Outside of Trading Hours! <<<')
+				log.warning('>>> Outside of Trading Hours! <<<')
+			# else:
+
+			#check for open SPX positions
+			portfolioData = getOpenPositions()
+			positionFlag = checkOpenPositions(portfolioData, cSPX.symbol)
+
+			#check for open SPX orders
+			openOrderData = getOpenOrders()
+			openOrderFlag = checkOpenOrders(openOrderData, cSPX.symbol)
+
+			if (openOrderFlag == True):
+				if (positionFlag == True):
+					log.warning('>>> Open SPX Position or Order! <<<')
+				elif (positionFlag == False):
+					log.error('>>> Orphaned Orders! <<<')
+					app.reqGlobalCancel()
 			else:
-				#check for open SPX positions
-				portfolioData = getOpenPositions()
-				positionFlag = checkOpenPositions(portfolioData, cSPX.symbol)
+				log.info('>>> No open SPX positions/orders <<<')
 
-				#check for open SPX orders
-				openOrderData = getOpenOrders()
-				openOrderFlag = checkOpenOrders(openOrderData, cSPX.symbol)
-
-				if (positionFlag == True) or (openOrderFlag == True):
-					print(f'\n>>> Open SPX Position or Order! - Waiting {loopDelay} seconds <<<')
-				else:
-					print(f'\n>>> No open SPX positions/orders; processing...')
-
-				vixFlag = checkVixPrice(vixId)
-				if (vixFlag == True):
-					print(f'>>> Current VIX price above $30 threshold! <<< ')
+			[vixFlag, targetDelta] = checkVixPrice(vixId)
+			if (vixFlag == True):
+				log.warning('>>> Current VIX price above $30 threshold! <<< ')
 
 			#check if trade conditions are met
 			if (marketOpenFlag == True) and (positionFlag == False) and (openOrderFlag == False) and (vixFlag == False):
 				tradeConditionsMet = True
+				log.info('>>> Processing <<<')
 			else:
+				log.warning('>>> Trading Conditions Not Met - Waiting %s seconds <<<',loopDelay)
 				time.sleep(loopDelay)
 
 		#get current SPX price - probably not needed
 
 		try:
 			spxID = getReqID()
-			print('Get Market Data')
+			log.info('Get Market Data')
 			getMarketData(spxID, cSPX)
 			time.sleep(1)
 
 			#check trading hours to use last or close price
-			if tradingHours():
+			if marketOpenFlag == True:
 				tickPrice = TickTypeEnum.LAST + 1
 			else:
 				tickPrice = TickTypeEnum.CLOSE + 1
 
-			print('Find last price')
+			log.info('Find last price')
 			for i in range(len(app.marketData)):
+				log.debug('market data: \n%s',app.marketData[i])
 				if (app.marketData[i][0] == spxID):
 					spxCurrentPrice = app.marketData[i][tickPrice]
 
-			print(f'SPX price: {spxCurrentPrice}')
+			log.info(f'SPX price: %s',spxCurrentPrice)
 			stopMarketData(spxID)
 			# print('Calc price target')
 			priceTarget = round((spxCurrentPrice * targetFactor), 0)
-			print(f'\nCurrent SPX Price: {spxCurrentPrice} \nPrice Target: {priceTarget}\n')
+			log.info('Current SPX Price: %s Price Target: %s', spxCurrentPrice, priceTarget)
 		except:
-			print('\nUnable to get SPX price target')
+			log.critical('Failure')
+			raise ValueError('Unable to get SPX price target')
 
 		#get contract IDs for combo legs, loop until valid data is returned
-		[shortConID, longConID, tradingClass, conExpDate] = comboLegLoop(cSPX, priceTarget, tradeMargin)
-		print('>>> Building Options Spread Contract...')
+		[shortConID, longConID, tradingClass, conExpDate] = comboLegLoop(cSPX, priceTarget, tradeMargin, targetDelta)
+		log.info('>>> Building Options Spread Contract...')
 
 		#options spread contract
 		c = Contract()
@@ -799,11 +982,12 @@ def optionsStrategy():
 		while (orderFilled == False):
 
 			orderPrice = getOrderPrice(comboID, orderMod, lastParentId, lastOrderPrice)
-			comboOrder = getComboOrder(orderPrice)
+			comboOrder = getComboOrder(orderPrice, tradeMargin, profitTarget, stopTarget, qty, conExpDate)
+			oid = comboOrder[0].orderId
 
 			#send order to TWS
 			try:
-				print('Placing Order')
+				log.info('Placing Order')
 				for o in comboOrder:
 					# pprint.pprint(o.__dict__)
 					app.placeOrder(o.orderId, c, o)
@@ -811,7 +995,7 @@ def optionsStrategy():
 				lastParentId = comboOrder[0].orderId
 				lastOrderPrice = comboOrder[0].lmtPrice
 			except:
-				print('Unable to place order')
+				log.error('Unable to place order')
 
 			time.sleep(1)
 			getOpenOrders()
@@ -821,23 +1005,24 @@ def optionsStrategy():
 			if len(app.executions) == 0:
 				orderMod = True
 			else:
-				orderFilled = True
+				# orderFilled = True
 				orderMOd = False
 				for i in range(len(app.executions)):
-					print(app.executions[i][4])
-					try:
-						execution = app.executions[i][4]
-						filledId = execution.orderId
-						print(filledId)
-						if filledID == oid:
-							orderFilled = True
-						else:
-							orderMod = True
-					except:
-						print('Execution exception!')
+					# try:
+					filledId = app.executions[i][4]
+					execTime = app.executions[i][1]
+
+					if filledId == oid:
+						orderFilled = True
+						log.info('Order %s filled at %s', filledId, execTime)
+					else:
+						orderMod = True
+					# except:
+					# 	log.error('Execution exception!')
 
 
-			print(f'\nOrder Filled: {orderFilled}\nOrder Mod: {orderMod}')
+			log.info('Order Filled: %s', orderFilled)
+			log.info('Order Mod: %s', orderMod)
 			"""
 			Todo:
 			test order execution & modification logic
@@ -852,9 +1037,11 @@ def optionsStrategy():
 #execute optionsStrategy
 try:
 	optionsStrategy()
-except:
+except KeyboardInterrupt:
+	log.info('Shutting down...')
+finally:
 	# app.reqGlobalCancel()
 	app.cancelOrder(lastParentId)
 	stopAllMarketData()
-
-app.disconnect()
+	app.disconnect()
+	logging.shutdown()

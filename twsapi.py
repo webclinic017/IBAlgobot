@@ -25,9 +25,7 @@ import datetime
 import pandas as pd
 import pprint
 
-#log config
-logging.basicConfig(filename=f'trading_bot.log', level=logging.INFO)
-logging.debug("now is %s", datetime.datetime.now())
+module_logger = logging.getLogger('IBTradingBot.twsapi')
 
 #define IB API class
 class IBapi(EWrapper, EClient):
@@ -48,6 +46,9 @@ class IBapi(EWrapper, EClient):
 		self.executions = []
 		self.commissions = []
 		self.orders = {}
+		self.accountLogUpdate = None
+		self.connected = False
+		self.logger = logging.getLogger('IBTradingBot.twsapi.IBapi')
 
 	def currentTime(self, t):
 		# t = time.ctime(twsTime)
@@ -56,9 +57,10 @@ class IBapi(EWrapper, EClient):
 	def nextValidId(self, orderId: int):
 		super().nextValidId(orderId)
 
-		logging.debug("setting nextValidOrderId: %d", orderId)
+		self.logger.debug("setting nextValidOrderId: %d", orderId)
 		self.nextValidOrderId = orderId
-		print("NextValidId:", orderId)
+		self.logger.info("NextValidId: %s", orderId)
+		self.connected = True
 
 	def nextOrderId(self):
 		oid = self.nextValidOrderId
@@ -66,12 +68,18 @@ class IBapi(EWrapper, EClient):
 		return oid
 
 	def historicalData(self, reqID, bar):
-		print(f'Time: {bar.date} Close: {bar.close}')
+		# print(f'Time: {bar.date} Close: {bar.close}')
 		self.history.append([bar.date, bar.close])
 
 	def accountSummary(self, reqID: int, account: str, tag: str, value: str, currency: str):
 		super().accountSummary(reqID, account, tag, value, currency)
-		print("AccountSummary. ReqId:", reqID, "Account:", account, "Tag: ", tag, "Value:", value, "Currency:", currency)
+		# print("AccountSummary. ReqId:", reqID, "Account:", account, "Tag: ", tag, "Value:", value, "Currency:", currency)
+
+	def updateAccountTime(self, timeStamp: str):
+		super().updateAccountTime(timeStamp)
+		self.logger.info("UpdateAccountTime. Time: %s", timeStamp)
+		# print("UpdateAccountTime. Time:", timeStamp)
+		self.accountData.update({"Time": timeStamp})
 
 	def updateAccountValue(self, key: str, val: str, currency: str, accountName: str):
 		super().updateAccountValue(key, val, currency, accountName)
@@ -80,6 +88,9 @@ class IBapi(EWrapper, EClient):
 		self.accountData.update({"AccountName": accountName})
 		self.accountData.update({"Currency": currency})
 		self.accountData.update({key: val})
+
+
+
 		return(key,val,currency,accountName)
 
 	#Update Portfolio
@@ -106,14 +117,48 @@ class IBapi(EWrapper, EClient):
 		for desc in depthMktDataDescriptions:
 			print("DepthMktDataDescription.", desc)
 
-	def updateAccountTime(self, timeStamp: str):
-		super().updateAccountTime(timeStamp)
-		print("UpdateAccountTime. Time:", timeStamp)
-		self.accountData.update({"Time": timeStamp})
+
 
 	def accountDownloadEnd(self, accountName: str):
 		super().accountDownloadEnd(accountName)
-		print("AccountDownloadEnd. Account:", accountName)
+		self.logger.info("AccountDownloadEnd. Account: %s", accountName)
+		# print("AccountDownloadEnd. Account:", accountName)
+		updateTime = self.accountData.get("Time")
+		if (updateTime is not None) and (updateTime > '13:30'):
+			self.accountLog()
+
+	def accountLog(self):
+		todayDate = datetime.date.today()
+
+		if (self.accountLogUpdate == None) or ((todayDate - self.accountLogUpdate).days >= 1):
+
+			filepath = '/Users/derrickike/Documents/Trading/IBKR_Algo/'
+			accoutLogOutPath = filepath + 'AccountLog.csv'
+			# self.totalReturn = round((self.NetLiqVal - startingCash)/startingCash, 4)
+			# self.spxReturn = round((self.spx - self.spxStart)/self.spxStart, 4)
+			# data = [logDate, self.NetLiqVal, self.totalCash, self.unrealPNL, self.realPNL, self.excessLiq, self.maintMargin, self.spx, self.vix, self.shortDelta, self.totalReturn, self.spxReturn]
+
+			logDate = todayDate.strftime("%Y-%m-%d")
+
+			data = [logDate, self.accountData.get('NetLiquidation'),
+			self.accountData.get('TotalCashBalance'),
+			self.accountData.get('UnrealizedPnL'),
+			self.accountData.get('RealizedPnL'),
+			self.accountData.get('ExcessLiquidity'),
+			self.accountData.get('MaintMarginReq')]
+			# app.accountData.get('SPX'),
+			# app.accountData.get('VIX'),
+			# app.accountData.get('ShortDelta')]
+			# app.accountData.get('total return')]
+			# app.accountData.get('spx return')]
+			accountDF = pd.DataFrame([data], columns=['Date','NetLiqVal','TotalCash','UnrealPNL','RealPNL','ExcessLiquidity','maintMargin'])
+
+			accountDF.to_csv(accoutLogOutPath, mode='a', index=False, header=(not os.path.exists(accoutLogOutPath)))
+
+			# print(accountDF)
+			self.logger.info('Account Log:\n%s',accountDF)
+
+			self.accountLogUpdate = todayDate
 
 	#function to update market data array with new incoming tick data
 	def mktDataUpdate(self, reqID, ticktype, mktData):
@@ -132,6 +177,7 @@ class IBapi(EWrapper, EClient):
 			# print(f'\nMarket Data Update: \n{data}')
 			self.marketData.append(data)
 
+		# self.logger.debug('mktdataUpdate: \n%s', self.marketData)
 		# print(f'\nMarket Data: \n{self.marketData}')
 
 	# ! [tickprice]
@@ -196,8 +242,11 @@ class IBapi(EWrapper, EClient):
 		# return (contractDetails)
 
 	def error(self, id, errorCode, errorMsg):
-		super().error(id, errorCode, errorMsg)
-		print(f'ID: {id} Code: {errorCode} Message: {errorMsg}')
+		# super().error(id, errorCode, errorMsg)
+		# print(f'ID: {id} Code: {errorCode} Message: {errorMsg}')
+		self.logger.error('ID: %s Code: %s Message: %s', id, errorCode, errorMsg)
+		if errorCode == 504:
+			self.connected = False
 
 	def openOrder(self, orderId: OrderId, contract: Contract, order: Order, orderState: OrderState):
 		super().openOrder(orderId, contract, order, orderState)
@@ -206,7 +255,7 @@ class IBapi(EWrapper, EClient):
 		order.contract = contract
 		self.permId2ord[order.permId] = order
 
-		self.openOrders.append([order.permId, order.clientId, orderId, order.account, contract.symbol,
+		self.openOrders.append([order.permId, order.clientId, order.orderRef, order.parentId, orderId, order.account, contract.symbol,
 		contract.secType, contract.exchange, order.action, order.orderType, order.totalQuantity, order.cashQty,
 		order.lmtPrice, order.auxPrice, orderState.status])
 		self.orders.update({orderId:order})
@@ -215,7 +264,7 @@ class IBapi(EWrapper, EClient):
 	def openOrderEnd(self):
 		super().openOrderEnd()
 		# print("OpenOrderEnd")
-		logging.debug("Received %d openOrders", len(self.permId2ord))
+		self.logger.debug("Received %d openOrders", len(self.permId2ord))
 
 	def orderStatus(self, orderId: OrderId, status: str, filled: float,
                     remaining: float, avgFillPrice: float, permId: int,
@@ -237,11 +286,18 @@ class IBapi(EWrapper, EClient):
 	def execDetails(self, reqId: int, contract: Contract, execution: Execution):
 		super().execDetails(reqId, contract, execution)
 		# print("ExecDetails. ReqId:", reqId, "Symbol:", contract.symbol, "SecType:", contract.secType, "Currency:", contract.currency, execution)
-		pprint.pprint(execution.__dict__)
+		# pprint.pprint(execution.__dict__)
+		# data = execution.__dict__.values()
 		data = [execution.acctNumber, execution.time, execution.clientId, execution.permId, execution.orderId, execution.execId, contract.symbol, contract.secType, execution.exchange,
 		execution.side, execution.shares, execution.price, execution.liquidation, execution.cumQty, execution.avgPrice, execution.orderRef, execution.evRule, execution.evMultiplier,
 		execution.modelCode, execution.lastLiquidity]
+		# print('Execution Details: \n',data)
+		execStatus = pd.DataFrame([data], columns=['AcctNo','ExecTime','ClientId',
+		'PermId','OrderId','ExecId','Symbol','SecType','Exchange','Side','Shares',
+		'Price','Liquidation','cumQty','AvgPrice','OrderRef','evRule','evMultiplier',
+		'ModelCode','lastLiquidity'])
 		self.executions.append(data)
+		self.logger.info('Execution Details: \n%s\n', execStatus)
 		self.tradeLog([data])
 
 	def commissionReport(self, commissionReport: CommissionReport):
